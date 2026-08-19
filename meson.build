@@ -13,7 +13,10 @@ dependencies = [
 
 airburst_exe = executable(
         'airburst_exe',
-        'src/imu_test.c',
+        [
+                'src/imu_test.c',
+                'src/functions.c',
+        ],
         dependencies : dependencies,
         install : true
 )

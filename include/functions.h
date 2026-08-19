@@ -2,6 +2,7 @@
 #define AIRBURST_EXE_FUNCTIONS_H
 
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdbool.h>
@@ -20,7 +21,11 @@ typedef enum {
     WAITING_FOR_STABILITY,
 } airbust_state_t;
 
+double calculate_dt (struct timespec *previous_time, struct timespec *current_time);
 airbust_state_t airburst_fall_state (accel_value_t accel_value, gyro_value_t gyro_value);
-
+void quaternion_prediction_stage_1 (double *q_w, double *q_x, double *q_y, double *q_z, double g_x, double g_y, double g_z, double dt);
+void measurement_prediction_stage_2 (double q_w, double q_x, double q_y, double q_z, double *predicted_g_x, double *predicted_g_y, double *predicted_g_z);
+void acceleration_measurement_stage_3 (double a_x, double a_y, double a_z, double *z_x, double *z_y, double *z_z);
+void residual_stage_4 (double z_x, double z_y, double z_z, double predicted_g_x, double predicted_g_y, double predicted_g_z, double *residual_x, double *residual_y, double *residual_z);
 
 #endif //AIRBURST_EXE_FUNCTIONS_H
