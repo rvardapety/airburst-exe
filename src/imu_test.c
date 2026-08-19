@@ -6,11 +6,61 @@
 
 #include "include/functions.h"
 
+double q_w = 1.0;
+double q_x = 0.0;
+double q_y = 0.0;
+double q_z = 0.0;
+
+double z_x = 0.0;
+double z_y = 0.0;
+double z_z = 0.0;
+
+double residual_x = 0.0;
+double residual_y = 0.0;
+double residual_z = 0.0;
+
+double gyro_bias_x = 0.0;
+double gyro_bias_y = 0.0;
+double gyro_bias_z = 0.0;
+
+double predicted_g_x = 0.0;
+double predicted_g_y = 0.0;
+double predicted_g_z = 0.0;
+
+double H[3][4] = {{0.0}};   // Measurement Jacobian
+double F[4][4] = {{0.0}};    // State transition Jacobian
+double R[3][3] = {{0.0}};    // Measurement noise covariance
+double S[3][3] = {{0.0}};    // Innovation covariance
+double K[4][3] = {{0.0}};    // Kalman gain
+
+double P[4][4] = {          // State covariance matrix
+    {0.01, 0.0,  0.0,  0.0},
+    {0.0,  0.01, 0.0,  0.0},
+    {0.0,  0.0,  0.01, 0.0},
+    {0.0,  0.0,  0.0,  0.01}
+};
+
+double Q[4][4] = {
+    {0.0001, 0.0,    0.0,    0.0},
+    {0.0,    0.0001, 0.0,    0.0},
+    {0.0,    0.0,    0.0001, 0.0},
+    {0.0,    0.0,    0.0,    0.0001}
+};
+
 int main (void) {
 
     bool state = true;
 
     imu_i2c_init();
+
+    calculate_gyro_bias(&gyro_bias_x, &gyro_bias_y, &gyro_bias_z);
+
+    printf(
+        "Gyro bias: X=%.6f Y=%.6f Z=%.6f rad/s\n",
+        gyro_bias_x,
+        gyro_bias_y,
+        gyro_bias_z
+    );
 
     gyro_value_t gyro;
     accel_value_t accel;
@@ -29,9 +79,9 @@ int main (void) {
         imu_get_gyro_data(&gyro);
         imu_get_accel_data(&accel);
 
-        double g_x = (double)gyro.gyro_x;
-        double g_y = (double)gyro.gyro_y;
-        double g_z = (double)gyro.gyro_z;
+        double g_x = (double)gyro.gyro_x - gyro_bias_x;
+        double g_y = (double)gyro.gyro_y - gyro_bias_y;
+        double g_z = (double)gyro.gyro_z - gyro_bias_z;
 
         double a_x = (double)accel.accel_x - 0.023;
         double a_y = (double)accel.accel_y - 0.051;

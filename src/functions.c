@@ -41,6 +41,32 @@ airbust_state_t airburst_fall_state (accel_value_t accel_value, gyro_value_t gyr
     return WAITING_FOR_STABILITY;
 }
 
+void calculate_gyro_bias (double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z) {
+
+    gyro_value_t gyro;
+
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_z = 0.0;
+
+    int measurement_count = 100;
+
+    for (int i = 0; i < measurement_count; i++) {
+
+        imu_get_gyro_data(&gyro);
+
+        sum_x += (double)gyro.gyro_x;
+        sum_y += (double)gyro.gyro_y;
+        sum_z += (double)gyro.gyro_z;
+
+        usleep(10000);
+    }
+
+    *gyro_bias_x = sum_x / measurement_count;
+    *gyro_bias_y = sum_y / measurement_count;
+    *gyro_bias_z = sum_z / measurement_count;
+}
+
 double calculate_dt(struct timespec *previous_time, struct timespec *current_time)
 {
     double dt = (double)(current_time->tv_sec - previous_time->tv_sec)
@@ -326,6 +352,14 @@ void quaternion_correction_stage_10 (double *q_w, double *q_x, double *q_y, doub
           K[3][0] * residual_x
         + K[3][1] * residual_y
         + K[3][2] * residual_z;
+
+    printf(
+        "Correction: w=%.6f x=%.6f y=%.6f z=%.6f\n",
+        correction_w,
+        correction_x,
+        correction_y,
+        correction_z
+    );
 
     *q_w += correction_w;
     *q_x += correction_x;
