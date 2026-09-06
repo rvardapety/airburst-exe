@@ -1,75 +1,61 @@
-#include "imu.h"
-#include <time.h>
-#include <math.h>
 #include <stdio.h>
 #include <unistd.h>
 
+#include "airburst.h"
 #include "include/functions.h"
+
+double distance_threshold = 1.0;
 
 double q_w = 1.0;
 double q_x = 0.0;
 double q_y = 0.0;
 double q_z = 0.0;
 
-double z_x = 0.0;
-double z_y = 0.0;
-double z_z = 0.0;
-
-double residual_x = 0.0;
-double residual_y = 0.0;
-double residual_z = 0.0;
-
 double gyro_bias_x = 0.0;
 double gyro_bias_y = 0.0;
 double gyro_bias_z = 0.0;
 
-double predicted_g_x = 0.0;
-double predicted_g_y = 0.0;
-double predicted_g_z = 0.0;
-
-double H[3][4] = {{0.0}};   // Measurement Jacobian
-double F[4][4] = {{0.0}};    // State transition Jacobian
-double R[3][3] = {{0.0}};    // Measurement noise covariance
-double S[3][3] = {{0.0}};    // Innovation covariance
-double K[4][3] = {{0.0}};    // Kalman gain
-
-double P[4][4] = {          // State covariance matrix
-    {0.01, 0.0,  0.0,  0.0},
-    {0.0,  0.01, 0.0,  0.0},
-    {0.0,  0.0,  0.01, 0.0},
-    {0.0,  0.0,  0.0,  0.01}
+double P[4][4] = {
+    {0.01, 0.0, 0.0, 0.0},
+    {0.0, 0.01, 0.0, 0.0},
+    {0.0, 0.0, 0.01, 0.0},
+    {0.0, 0.0, 0.0, 0.01}
 };
 
 double Q[4][4] = {
-    {0.0001, 0.0,    0.0,    0.0},
-    {0.0,    0.0001, 0.0,    0.0},
-    {0.0,    0.0,    0.0001, 0.0},
-    {0.0,    0.0,    0.0,    0.0001}
+    {0.0001, 0.0, 0.0, 0.0},
+    {0.0, 0.0001, 0.0, 0.0},
+    {0.0, 0.0, 0.0001, 0.0},
+    {0.0, 0.0, 0.0, 0.0001}
 };
 
-int main (void) {
+double R[3][3] = {{0.0}};
+double H[3][4] = {{0.0}};
+double F[4][4] = {{0.0}};
+double S[3][3] = {{0.0}};
+double K[4][3] = {{0.0}};
 
+int main(void)
+{
     bool state = true;
 
     imu_i2c_init();
+    airburst_init();
+    airburst_distance_init();
 
     calculate_gyro_bias(&gyro_bias_x, &gyro_bias_y, &gyro_bias_z);
 
-    printf(
-        "Gyro bias: X=%.6f Y=%.6f Z=%.6f rad/s\n",
-        gyro_bias_x,
-        gyro_bias_y,
-        gyro_bias_z
-    );
+    printf("Gyro bias: X=%.6f Y=%.6f Z=%.6f rad/s\n", gyro_bias_x, gyro_bias_y, gyro_bias_z);
 
     gyro_value_t gyro;
     accel_value_t accel;
 
-    struct timespec previous_time, current_time;
+    struct timespec previous_time;
+    struct timespec current_time;
+
     clock_gettime(CLOCK_MONOTONIC, &previous_time);
 
     while (state) {
-
         clock_gettime(CLOCK_MONOTONIC, &current_time);
 
         double dt = calculate_dt(&previous_time, &current_time);
@@ -83,74 +69,53 @@ int main (void) {
         double g_y = (double)gyro.gyro_y - gyro_bias_y;
         double g_z = (double)gyro.gyro_z - gyro_bias_z;
 
+        gyro.gyro_x = (float)g_x;
+        gyro.gyro_y = (float)g_y;
+        gyro.gyro_z = (float)g_z;
+
         double a_x = (double)accel.accel_x - 0.023;
         double a_y = (double)accel.accel_y - 0.051;
         double a_z = (double)accel.accel_z;
 
-        // EKF STAGE 1: Quaternion prediction
+        ekf_update(&q_w, &q_x, &q_y, &q_z, P, Q, R, H, F, S, K, g_x, g_y, g_z, a_x, a_y, a_z, dt);
 
-        quaternion_prediction_stage_1(&q_w, &q_x, &q_y, &q_z, g_x, g_y, g_z, dt);
+        //radar angle calculation
+        double radar_angle = calculate_radar_angle(q_w, q_x, q_y, q_z);
+        printf("Radar angle: %.2f degrees\n", radar_angle);
 
-        // EKF STAGE 2: Predicted measurement
+        switch (airburst_fall_state(accel, gyro, radar_angle)) {
+        case UNSTABLE:
+            airburst_destabilized();
+            printf("STATE: UNSTABLE\n");
+            break;
 
-        measurement_prediction_stage_2(q_w, q_x, q_y, q_z, &predicted_g_x, &predicted_g_y, &predicted_g_z);
+        case STABLE:
+            airburst_stabilized();
+            printf("STATE: STABLE\n");
+            break;
 
-        // EKF STAGE 3: Accelerometer measurement
+        case MEASURING: {
+                double distance = airburst_get_distance_m();
 
-        acceleration_measurement_stage_3(a_x, a_y, a_z, &z_x, &z_y, &z_z);
+                printf("STATE: MEASURING | Distance: %.2f m\n", distance);
 
-        // EKF STAGE 4: Residual
+                if (distance <= distance_threshold) {
+                    airburst_bust_bomb();
+                    printf("BURST!\n");
+                    state = false;
+                }
 
-        residual_stage_4(z_x, z_y, z_z, predicted_g_x, predicted_g_y, predicted_g_z, &residual_x, &residual_y, &residual_z);
+                break;
+        }
 
-        // EKF STAGE 5: Measurement Jacobian H
-
-        measurement_jacobian_h_stage_5(q_w, q_x, q_y, q_z, H);
-
-        // EKF STAGE 6: State transition Jacobian F
-
-        state_transition_jacobian_f_stage_6(g_x, g_y, g_z, dt, F);
-
-        // EKF STAGE 6: Covariance prediction
-
-        covariance_prediction_stage_6(P, F, Q);
-
-        // EKF STAGE 7: Measurement noise R
-
-        measurement_noise_stage_7(R);
-
-        // EKF STAGE 8: Innovation covariance S
-
-        innovation_covariance_stage_8(H, P, R, S);
-
-        // EKF STAGE 9: Kalman gain K
-
-        kalman_gain_stage_9(P, H, S, K);
-
-        // EKF STAGE 10: Quaternion correction
-
-        quaternion_correction_stage_10(&q_w, &q_x, &q_y, &q_z, K, residual_x, residual_y, residual_z);
-
-        // EKF STAGE 11: Covariance update
-
-        covariance_update_stage_11(P, K, H);
-
-        printf("Acceleration X: %.3f g | Y: %.3f g | Z: %.3f g\n", a_x, a_y, a_z);
-
-        printf("Gyro X: %.6f rad/s | Y: %.6f rad/s | Z: %.6f rad/s\n", g_x, g_y, g_z);
-
-        printf("Quaternion: qw=%.6f qx=%.6f qy=%.6f qz=%.6f\n", q_w, q_x, q_y, q_z);
-
-        printf("Predicted gravity: X=%.6f Y=%.6f Z=%.6f\n", predicted_g_x, predicted_g_y, predicted_g_z);
-
-        printf("Measurement: X=%.6f Y=%.6f Z=%.6f\n", z_x, z_y, z_z);
-
-        printf("Residual: X=%.6f Y=%.6f Z=%.6f\n", residual_x, residual_y, residual_z);
+        default:
+            break;
+        }
 
         usleep(200000);
     }
-
-    // imu_i2c_deinit();
+    airburst_distance_destroy();
+    airburst_destroy();
 
     return 0;
 }
