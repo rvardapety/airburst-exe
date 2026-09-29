@@ -8,6 +8,7 @@ m_dep = cc.find_library('m', required : true)
 dependencies = [
         dependency('airburst'),
         dependency('imu_lib'),
+        dependency('esp32cam_lib'),
         m_dep,
 ]
 

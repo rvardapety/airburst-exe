@@ -65,19 +65,15 @@ int main(void)
         imu_get_gyro_data(&gyro);
         imu_get_accel_data(&accel);
 
-        double g_x = (double)gyro.gyro_x - gyro_bias_x;
-        double g_y = (double)gyro.gyro_y - gyro_bias_y;
-        double g_z = (double)gyro.gyro_z - gyro_bias_z;
-
-        gyro.gyro_x = (float)g_x;
-        gyro.gyro_y = (float)g_y;
-        gyro.gyro_z = (float)g_z;
+        gyro.gyro_x = (float)((double)gyro.gyro_x - gyro_bias_x);
+        gyro.gyro_y = (float)((double)gyro.gyro_y - gyro_bias_y);
+        gyro.gyro_z  = (float)((double)gyro.gyro_z - gyro_bias_z);
 
         double a_x = (double)accel.accel_x - 0.023;
         double a_y = (double)accel.accel_y - 0.051;
         double a_z = (double)accel.accel_z;
 
-        ekf_update(&q_w, &q_x, &q_y, &q_z, P, Q, R, H, F, S, K, g_x, g_y, g_z, a_x, a_y, a_z, dt);
+        ekf_update(&q_w, &q_x, &q_y, &q_z, P, Q, R, H, F, S, K, gyro.gyro_x, gyro.gyro_y, gyro.gyro_z, a_x, a_y, a_z, dt);
 
         //radar angle calculation
         double radar_angle = calculate_radar_angle(q_w, q_x, q_y, q_z);
