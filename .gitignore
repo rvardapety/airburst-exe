@@ -5,3 +5,5 @@ buildDir
 
 /subprojects/*
 !/subprojects/*.wrap
+
+__pycache__/
