@@ -5,14 +5,21 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "airburst.h"
 // #include "esp32_cam.h"
 #include "functions.h"
 
+// Usage: airburst_exe [--csv]
+//   default : one human-readable status line per control step on stdout
+//   --csv   : one CSV row per control step on stdout (header first), e.g.
+//             ./airburst_exe --csv > run.csv
+// Status, warning and error messages always go to stderr.
+
 // Timing: IMU + EKF run every IMU_PERIOD_NS (100 Hz). The state machine, radar
-// and printout run every CONTROL_DIVIDER-th sample (5 Hz), so the stability
+// and output run every CONTROL_DIVIDER-th sample (5 Hz), so the stability
 // window stays STABLE_MEASUREMENT_COUNT * 0.2 s = 2 s.
 #define IMU_PERIOD_NS   10000000L
 #define CONTROL_DIVIDER 20
@@ -22,34 +29,9 @@ static const double DISTANCE_THRESHOLD_M = 1.0;
 
 static volatile sig_atomic_t running = 1;
 
-static double q_w = 1.0;
-static double q_x = 0.0;
-static double q_y = 0.0;
-static double q_z = 0.0;
-
-static double gyro_bias_x = 0.0;
-static double gyro_bias_y = 0.0;
-static double gyro_bias_z = 0.0;
-
-static double P[4][4] = {
-    {0.01, 0.0, 0.0, 0.0},
-    {0.0, 0.01, 0.0, 0.0},
-    {0.0, 0.0, 0.01, 0.0},
-    {0.0, 0.0, 0.0, 0.01}
-};
-
-static double Q[4][4] = {
-    {0.0001, 0.0, 0.0, 0.0},
-    {0.0, 0.0001, 0.0, 0.0},
-    {0.0, 0.0, 0.0001, 0.0},
-    {0.0, 0.0, 0.0, 0.0001}
-};
-
-static double R[3][3] = {{0.0}};
-static double H[3][4] = {{0.0}};
-static double F[4][4] = {{0.0}};
-static double S[3][3] = {{0.0}};
-static double K[4][3] = {{0.0}};
+static ekf_t ekf;
+static double gyro_bias[3] = {0.0, 0.0, 0.0};
+static bool csv_output = false;
 
 static void handle_stop_signal(int signal_number)
 {
@@ -95,12 +77,40 @@ static const char *state_name(airburst_state_t state)
     }
 }
 
+// One output line per control step.
+// distance_m: NAN = not measured in this step, AIRBURST_NO_DISTANCE (< 0) = no target
+static void print_status(double time_s, double dt, double radar_angle, double accel_magnitude,
+                         double gyro_magnitude, bool accel_used, airburst_state_t state, double distance_m)
+{
+    if (csv_output) {
+        printf("%.3f,%.4f,%.2f,%.3f,%.4f,%d,%s,", time_s, dt, radar_angle, accel_magnitude,
+               gyro_magnitude, accel_used ? 1 : 0, state_name(state));
+        if (!isnan(distance_m)) {
+            printf("%.3f", distance_m);
+        }
+        printf("\n");
+        return;
+    }
+
+    printf("Radar angle: %6.2f deg | |a| = %.3f g | |w| = %.3f rad/s | dt = %.4f s%s | STATE: %s",
+           radar_angle, accel_magnitude, gyro_magnitude, dt, accel_used ? "" : " (gyro only)", state_name(state));
+
+    if (isnan(distance_m)) {
+        printf("\n");
+    } else if (distance_m < 0.0) {
+        printf(" | Distance: no target\n");
+    } else {
+        printf(" | Distance: %.2f m\n", distance_m);
+    }
+}
+
 // Main simulation loop. Returns true if the burst LED fired, false if a stop signal arrived.
 static bool run_simulation(void)
 {
     gyro_value_t gyro = {0.0f, 0.0f, 0.0f};
     accel_value_t accel = {0.0f, 0.0f, 0.0f};
 
+    struct timespec start_time;
     struct timespec previous_time;
     struct timespec current_time;
     struct timespec next_wakeup;
@@ -108,8 +118,13 @@ static bool run_simulation(void)
     int sample_count = 0;
     bool fired = false;
 
-    clock_gettime(CLOCK_MONOTONIC, &previous_time);
-    next_wakeup = previous_time;
+    if (csv_output) {
+        printf("time_s,dt_s,angle_deg,accel_g,gyro_rad_s,accel_used,state,distance_m\n");
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    previous_time = start_time;
+    next_wakeup = start_time;
 
     while (running) {
         timespec_add_ns(&next_wakeup, IMU_PERIOD_NS);
@@ -125,8 +140,8 @@ static bool run_simulation(void)
 
         // Skip this sample on a failed read; previous_time is not advanced,
         // so the next dt covers the skipped interval
-        if (!imu_get_gyro_data(&gyro) || !imu_get_accel_data(&accel)) {
-            printf("WARNING: IMU read failed, skipping sample\n");
+        if (!imu_get_data(&accel, &gyro)) {
+            fprintf(stderr, "WARNING: IMU read failed, skipping sample\n");
             continue;
         }
 
@@ -134,86 +149,86 @@ static bool run_simulation(void)
         double dt = calculate_dt(&previous_time, &current_time);
 
         // Bias/offset-corrected sensor values, used by both the EKF and the state machine
-        double g_x = (double)gyro.gyro_x - gyro_bias_x;
-        double g_y = (double)gyro.gyro_y - gyro_bias_y;
-        double g_z = (double)gyro.gyro_z - gyro_bias_z;
+        double g[3] = {
+            (double)gyro.gyro_x - gyro_bias[0],
+            (double)gyro.gyro_y - gyro_bias[1],
+            (double)gyro.gyro_z - gyro_bias[2]
+        };
+        double a[3] = {
+            (double)accel.accel_x - ACCEL_OFFSET_X_G,
+            (double)accel.accel_y - ACCEL_OFFSET_Y_G,
+            (double)accel.accel_z - ACCEL_OFFSET_Z_G
+        };
 
-        double a_x = (double)accel.accel_x - ACCEL_OFFSET_X_G;
-        double a_y = (double)accel.accel_y - ACCEL_OFFSET_Y_G;
-        double a_z = (double)accel.accel_z - ACCEL_OFFSET_Z_G;
+        bool accel_used = ekf_update(&ekf, g, a, dt);
 
-        bool accel_used = ekf_update(&q_w, &q_x, &q_y, &q_z, P, Q, R, H, F, S, K, g_x, g_y, g_z, a_x, a_y, a_z, dt);
-
-        // Control step (5 Hz): state machine, LEDs, radar, printout
+        // Control step (5 Hz): state machine, LEDs, radar, output
         if (++sample_count < CONTROL_DIVIDER) {
             continue;
         }
         sample_count = 0;
 
-        double radar_angle = calculate_radar_angle(q_w, q_x, q_y, q_z);
-        double accel_magnitude = sqrt(a_x * a_x + a_y * a_y + a_z * a_z);
-        double gyro_magnitude = sqrt(g_x * g_x + g_y * g_y + g_z * g_z);
+        double radar_angle = ekf_radar_angle_deg(&ekf);
+        double accel_magnitude = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        double gyro_magnitude = sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        double distance = NAN;
 
         airburst_state_t state = airburst_fall_state(accel_magnitude, gyro_magnitude, radar_angle);
-
-        printf("Radar angle: %6.2f deg | |a| = %.3f g | |w| = %.3f rad/s | dt = %.4f s%s | STATE: %s",
-               radar_angle, accel_magnitude, gyro_magnitude, dt,
-               accel_used ? "" : " (gyro only)", state_name(state));
 
         switch (state) {
         case UNSTABLE:
             airburst_destabilized();
-            printf("\n");
             break;
 
         case STABLE:
             airburst_stabilized();
-            printf("\n");
             break;
 
-        case MEASURING: {
-            float raw_distance = airburst_get_distance_m();
+        case MEASURING:
+            // AIRBURST_NO_DISTANCE (< 0) on sensor error or no target: never triggers
+            distance = (double)airburst_get_distance_m();
+            break;
 
-            // Sensor error or no target: never trigger on an invalid reading
-            if (raw_distance < 0.0f) {   // AIRBURST_NO_DISTANCE
-                printf(" | Distance: no target\n");
-                break;
-            }
-
-            double distance = (double)raw_distance;
-
-            printf(" | Distance: %.2f m\n", distance);
-
-            if (distance > 0.0 && distance <= DISTANCE_THRESHOLD_M) {
-                airburst_led_on();
-                printf("LED ON!\n");
-                fired = true;
-                running = 0;
-            }
+        default:
             break;
         }
 
-        default:
-            printf("\n");
-            break;
+        print_status(timespec_diff_s(&current_time, &start_time), dt, radar_angle, accel_magnitude,
+                     gyro_magnitude, accel_used, state, distance);
+
+        if (state == MEASURING && distance > 0.0 && distance <= DISTANCE_THRESHOLD_M) {
+            airburst_led_on();
+            fprintf(stderr, "LED ON!\n");
+            fired = true;
+            running = 0;
         }
     }
 
     return fired;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     int exit_code = EXIT_FAILURE;
     bool rss_active = false;
     bool distance_active = false;
 
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--csv") == 0) {
+            csv_output = true;
+        } else {
+            fprintf(stderr, "Usage: %s [--csv]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
     install_signal_handlers();
+    ekf_init(&ekf);
 
     if (!imu_i2c_init()) {
-        printf("ERROR: imu_i2c_init() failed\n");
+        fprintf(stderr, "ERROR: imu_i2c_init() failed\n");
     } else if (!airburst_init()) {
-        printf("ERROR: airburst_init() failed\n");
+        fprintf(stderr, "ERROR: airburst_init() failed\n");
     } else {
         rss_active = true;
 
@@ -221,18 +236,27 @@ int main(void)
 
         if (!airburst_distance_init()) {
             // On failure, airburst_distance_init() already deactivates RSS itself
-            printf("ERROR: airburst_distance_init() failed\n");
+            fprintf(stderr, "ERROR: airburst_distance_init() failed\n");
             rss_active = false;
         } else {
             distance_active = true;
 
-            if (!calculate_gyro_bias(&gyro_bias_x, &gyro_bias_y, &gyro_bias_z)) {
-                printf("ERROR: gyro bias calibration failed (no IMU data)\n");
+            double gyro_std_rad = 0.0;
+
+            if (!calculate_gyro_bias(gyro_bias, &gyro_std_rad)) {
+                fprintf(stderr, "ERROR: gyro bias calibration failed (no IMU data)\n");
             } else {
-                printf("Gyro bias: X=%.6f Y=%.6f Z=%.6f rad/s\n", gyro_bias_x, gyro_bias_y, gyro_bias_z);
+                fprintf(stderr, "Gyro bias: X=%.6f Y=%.6f Z=%.6f rad/s (noise %.4f rad/s)\n",
+                        gyro_bias[0], gyro_bias[1], gyro_bias[2], gyro_std_rad);
+
+                if (gyro_std_rad > GYRO_CALIBRATION_MAX_STD_RAD) {
+                    fprintf(stderr, "WARNING: device moved during gyro calibration "
+                                    "(%.4f > %.4f rad/s); bias may be wrong, restart with the device still\n",
+                            gyro_std_rad, GYRO_CALIBRATION_MAX_STD_RAD);
+                }
 
                 if (!run_simulation()) {
-                    printf("Stopped by signal\n");
+                    fprintf(stderr, "Stopped by signal\n");
                 }
                 exit_code = EXIT_SUCCESS;
             }

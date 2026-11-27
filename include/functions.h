@@ -18,9 +18,19 @@
 #define ACCEL_OFFSET_Y_G 0.051
 #define ACCEL_OFFSET_Z_G 0.0
 
+// Gyro bias calibration: number of samples (10 ms apart) and the largest per-axis
+// standard deviation (rad/s) accepted as "device held still"
+#define GYRO_CALIBRATION_SAMPLES 100
+#define GYRO_CALIBRATION_MAX_STD_RAD 0.02
+
 // EKF accelerometer gate: the accelerometer is only a gravity reference when
 // |a| is close to 1 g. Outside 1 g +/- ACCEL_GATE_G the EKF uses the gyro only.
 #define ACCEL_GATE_G 0.1
+
+// EKF tuning: initial covariance, process noise and accelerometer noise (diagonals)
+#define EKF_P0 0.01
+#define EKF_Q  0.0001
+#define EKF_R  0.01
 
 // IMU mounting convention (used by the EKF measurement model).
 // The value is the accelerometer Z reading, in g, when the radar is level (0 deg):
@@ -37,23 +47,34 @@ typedef enum {
     MEASURING
 } airburst_state_t;
 
+// EKF state: orientation quaternion q = [w, x, y, z] (rotates body -> world)
+// and its 4x4 covariance P, plus the constant noise matrices Q and R.
+typedef struct {
+    double q[4];
+    double P[4][4];
+    double Q[4][4];
+    double R[3][3];
+} ekf_t;
 
 airburst_state_t airburst_fall_state(double accel_magnitude_g, double gyro_magnitude_rad, double radar_angle_deg);
 
 double calculate_dt(struct timespec *previous_time, const struct timespec *current_time);
-bool calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z);
-void quaternion_prediction_stage_1(double *q_w, double *q_x, double *q_y, double *q_z, double g_x, double g_y, double g_z, double dt);
-void measurement_prediction_stage_2(double q_w, double q_x, double q_y, double q_z, double *predicted_g_x, double *predicted_g_y, double *predicted_g_z);
-void acceleration_measurement_stage_3(double a_x, double a_y, double a_z, double *z_x, double *z_y, double *z_z);
-void residual_stage_4(double z_x, double z_y, double z_z, double predicted_g_x, double predicted_g_y, double predicted_g_z, double *residual_x, double *residual_y, double *residual_z);
-void measurement_jacobian_h_stage_5(double q_w, double q_x, double q_y, double q_z, double H[3][4]);
-void state_transition_jacobian_f_stage_6(double g_x, double g_y, double g_z, double dt, double F[4][4]);
-void covariance_prediction_stage_6(double P[4][4], double F[4][4], double Q[4][4]);
-void measurement_noise_stage_7(double R[3][3]);
-void innovation_covariance_stage_8(double H[3][4], double P[4][4], double R[3][3], double S[3][3]);
-bool kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double K[4][3]);
-void quaternion_correction_stage_10(double *q_w, double *q_x, double *q_y, double *q_z, double K[4][3], double residual_x, double residual_y, double residual_z);
-void covariance_update_stage_11(double P[4][4], double K[4][3], double H[3][4]);
-bool ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][4], double Q[4][4], double R[3][3], double H[3][4], double F[4][4], double S[3][3], double K[4][3], double g_x, double g_y, double g_z, double a_x, double a_y, double a_z, double dt);
-double calculate_radar_angle(double q_w, double q_x, double q_y, double q_z);
+
+// Averages GYRO_CALIBRATION_SAMPLES gyro readings into bias[x, y, z] (rad/s).
+// max_std_rad receives the largest per-axis standard deviation, i.e. how much the
+// device moved; compare it with GYRO_CALIBRATION_MAX_STD_RAD.
+// Returns false if no gyro sample could be read.
+bool calculate_gyro_bias(double bias[3], double *max_std_rad);
+
+// Sets q to identity and P, Q, R to their EKF_* diagonals.
+void ekf_init(ekf_t *ekf);
+
+// One EKF step: gyro prediction (always) and accelerometer correction (when |a|
+// is within 1 g +/- ACCEL_GATE_G). gyro in rad/s, accel in g, dt in s.
+// Returns true if the accelerometer correction was applied.
+bool ekf_update(ekf_t *ekf, const double gyro[3], const double accel[3], double dt);
+
+// Tilt between the body Z axis and the world Z axis, in degrees
+double ekf_radar_angle_deg(const ekf_t *ekf);
+
 #endif // AIRBURST_EXE_FUNCTIONS_H

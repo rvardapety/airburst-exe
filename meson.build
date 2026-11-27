@@ -23,7 +23,21 @@ airburst_exe = executable(
         install : true
 )
 
-test('test', airburst_exe)
+# Unit tests for src/functions.c with a stub IMU (no hardware needed).
+# Only the imu_lib headers are used, so the real I2C driver is not linked.
+# Cross builds cannot run ARM binaries on the PC; use tests/run_host_tests.sh there.
+functions_test = executable(
+        'functions_test',
+        [
+                'tests/test_functions.c',
+                'src/functions.c',
+        ],
+        include_directories : include_directories('include'),
+        dependencies : [dependency('imu_lib').partial_dependency(includes : true), m_dep],
+        install : false
+)
+
+test('functions', functions_test, timeout : 60)
 
 # A111 Envelope object detection at ~0.30 m, with a UDP feed for tools/envelope_view.py
 envelope_exe = executable(

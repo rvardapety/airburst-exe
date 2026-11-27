@@ -16,7 +16,9 @@ static void sleep_ms(long ms)
     nanosleep(&duration, NULL);
 }
 
+// =====================================================================
 // AIRBURST FALL / STABILITY STATE
+// =====================================================================
 // Called once per control step with bias/offset-corrected magnitudes.
 //   any state  --(conditions not met)-------------------------> UNSTABLE (count reset)
 //   UNSTABLE   --(conditions met for STABLE_MEASUREMENT_COUNT)--> STABLE
@@ -60,45 +62,53 @@ airburst_state_t airburst_fall_state(double accel_magnitude_g, double gyro_magni
     return current_state;
 }
 
+// =====================================================================
 // GYROSCOPE BIAS CALCULATION
-// Returns false if no gyro sample could be read; only successful reads are averaged
-bool calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z)
+// =====================================================================
+bool calculate_gyro_bias(double bias[3], double *max_std_rad)
 {
     gyro_value_t gyro = {0.0f, 0.0f, 0.0f};
 
-    double sum_x = 0.0;
-    double sum_y = 0.0;
-    double sum_z = 0.0;
-
-    const int measurement_count = 100;
+    double sum[3] = {0.0, 0.0, 0.0};
+    double sum_squares[3] = {0.0, 0.0, 0.0};
     int valid_count = 0;
 
-    for (int i = 0; i < measurement_count; i++) {
+    for (int i = 0; i < GYRO_CALIBRATION_SAMPLES; i++) {
         if (imu_get_gyro_data(&gyro)) {
-            sum_x += (double)gyro.gyro_x;
-            sum_y += (double)gyro.gyro_y;
-            sum_z += (double)gyro.gyro_z;
+            double sample[3] = {(double)gyro.gyro_x, (double)gyro.gyro_y, (double)gyro.gyro_z};
+
+            for (int axis = 0; axis < 3; axis++) {
+                sum[axis] += sample[axis];
+                sum_squares[axis] += sample[axis] * sample[axis];
+            }
             valid_count++;
         }
 
         sleep_ms(10);
     }
 
+    *max_std_rad = 0.0;
+
     if (valid_count == 0) {
-        *gyro_bias_x = 0.0;
-        *gyro_bias_y = 0.0;
-        *gyro_bias_z = 0.0;
+        bias[0] = bias[1] = bias[2] = 0.0;
         return false;
     }
 
-    *gyro_bias_x = sum_x / valid_count;
-    *gyro_bias_y = sum_y / valid_count;
-    *gyro_bias_z = sum_z / valid_count;
+    for (int axis = 0; axis < 3; axis++) {
+        double mean = sum[axis] / valid_count;
+        double variance = sum_squares[axis] / valid_count - mean * mean;
+        double std_dev = sqrt(fmax(variance, 0.0));
+
+        bias[axis] = mean;
+        *max_std_rad = fmax(*max_std_rad, std_dev);
+    }
 
     return true;
 }
 
+// =====================================================================
 // DT CALCULATION
+// =====================================================================
 double calculate_dt(struct timespec *previous_time, const struct timespec *current_time)
 {
     double dt = (double)(current_time->tv_sec - previous_time->tv_sec) + (double)(current_time->tv_nsec - previous_time->tv_nsec) / 1e9;
@@ -108,212 +118,181 @@ double calculate_dt(struct timespec *previous_time, const struct timespec *curre
     return dt;
 }
 
+// =====================================================================
+// SMALL MATRIX HELPERS (row-major, sizes given explicitly)
+// =====================================================================
 
-// EKF STAGE 1
-// Quaternion prediction
-void quaternion_prediction_stage_1(double *q_w, double *q_x, double *q_y, double *q_z, double g_x, double g_y, double g_z, double dt)
+// C[n][p] = A[n][m] * B[m][p]
+static void mat_mul(int n, int m, int p, double A[n][m], double B[m][p], double C[n][p])
 {
-    double alpha_w = -*q_x * g_x - *q_y * g_y - *q_z * g_z;
-    double alpha_x = *q_w * g_x + *q_y * g_z - *q_z * g_y;
-    double alpha_y = *q_w * g_y - *q_x * g_z + *q_z * g_x;
-    double alpha_z = *q_w * g_z + *q_x * g_y - *q_y * g_x;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < p; j++) {
+            C[i][j] = 0.0;
+            for (int k = 0; k < m; k++) {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
 
-    double qw_pred = *q_w + 0.5 * alpha_w * dt;
-    double qx_pred = *q_x + 0.5 * alpha_x * dt;
-    double qy_pred = *q_y + 0.5 * alpha_y * dt;
-    double qz_pred = *q_z + 0.5 * alpha_z * dt;
+// T[m][n] = A[n][m]^T
+static void mat_transpose(int n, int m, double A[n][m], double T[m][n])
+{
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < m; j++) {
+            T[j][i] = A[i][j];
+        }
+    }
+}
 
-    double q_magnitude = sqrt(qw_pred * qw_pred + qx_pred * qx_pred + qy_pred * qy_pred + qz_pred * qz_pred);
+static void normalize_quaternion(double q[4])
+{
+    double magnitude = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
 
-    if (q_magnitude < 1e-12) {
+    if (magnitude < 1e-12) {
         return;
     }
 
-    *q_w = qw_pred / q_magnitude;
-    *q_x = qx_pred / q_magnitude;
-    *q_y = qy_pred / q_magnitude;
-    *q_z = qz_pred / q_magnitude;
+    for (int i = 0; i < 4; i++) {
+        q[i] /= magnitude;
+    }
 }
 
-// EKF STAGE 2
-// Predicted gravity measurement in the BODY frame.
-// q rotates body -> world (see stage 1), so h(q) = IMU_GRAVITY_SIGN * R(q)^T * [0, 0, 1].
-void measurement_prediction_stage_2(double q_w, double q_x, double q_y, double q_z, double *predicted_g_x, double *predicted_g_y, double *predicted_g_z)
-{
-    *predicted_g_x = IMU_GRAVITY_SIGN * 2.0 * (q_x * q_z - q_w * q_y);
-    *predicted_g_y = IMU_GRAVITY_SIGN * 2.0 * (q_y * q_z + q_w * q_x);
-    *predicted_g_z = IMU_GRAVITY_SIGN * (q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z);
-}
+// =====================================================================
+// EKF - PREDICTION (gyroscope)
+// =====================================================================
 
-// EKF STAGE 3
-// Accelerometer measurement normalization
-void acceleration_measurement_stage_3(double a_x, double a_y, double a_z, double *z_x, double *z_y, double *z_z)
+// EKF STAGE 1 - Quaternion prediction: q <- normalize(q + 0.5 * q (x) [0, g] * dt)
+static void predict_quaternion_stage_1(double q[4], const double g[3], double dt)
 {
-    double accel_magnitude = sqrt(a_x * a_x + a_y * a_y + a_z * a_z);
+    double w = q[0], x = q[1], y = q[2], z = q[3];
 
-    if (accel_magnitude < 1e-9) {
-        *z_x = 0.0;
-        *z_y = 0.0;
-        *z_z = 0.0;
-        return;
+    double q_dot[4] = {
+        -x * g[0] - y * g[1] - z * g[2],
+         w * g[0] + y * g[2] - z * g[1],
+         w * g[1] - x * g[2] + z * g[0],
+         w * g[2] + x * g[1] - y * g[0]
+    };
+
+    for (int i = 0; i < 4; i++) {
+        q[i] += 0.5 * q_dot[i] * dt;
     }
 
-    *z_x = a_x / accel_magnitude;
-    *z_y = a_y / accel_magnitude;
-    *z_z = a_z / accel_magnitude;
+    normalize_quaternion(q);
 }
 
-// EKF STAGE 4
-// Residual
-void residual_stage_4(double z_x, double z_y, double z_z, double predicted_g_x, double predicted_g_y, double predicted_g_z, double *residual_x, double *residual_y, double *residual_z)
+// EKF STAGE 2 - State transition Jacobian F = d q_predicted / d q (matches stage 1)
+static void state_jacobian_f_stage_2(const double g[3], double dt, double F[4][4])
 {
-    *residual_x = z_x - predicted_g_x;
-    *residual_y = z_y - predicted_g_y;
-    *residual_z = z_z - predicted_g_z;
+    double hx = 0.5 * g[0] * dt;
+    double hy = 0.5 * g[1] * dt;
+    double hz = 0.5 * g[2] * dt;
+
+    double jacobian[4][4] = {
+        {1.0, -hx, -hy, -hz},
+        {hx,  1.0,  hz, -hy},
+        {hy,  -hz, 1.0,  hx},
+        {hz,   hy, -hx, 1.0}
+    };
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            F[i][j] = jacobian[i][j];
+        }
+    }
 }
 
-// EKF STAGE 5
-// Measurement Jacobian H = d h(q) / d [q_w, q_x, q_y, q_z] (must match stage 2)
-void measurement_jacobian_h_stage_5(double q_w, double q_x, double q_y, double q_z, double H[3][4])
+// EKF STAGE 3 - Covariance prediction: P <- F P F^T + Q
+static void predict_covariance_stage_3(double P[4][4], double F[4][4], double Q[4][4])
+{
+    double FP[4][4];
+    double F_transpose[4][4];
+    double FPFt[4][4];
+
+    mat_transpose(4, 4, F, F_transpose);
+    mat_mul(4, 4, 4, F, P, FP);
+    mat_mul(4, 4, 4, FP, F_transpose, FPFt);
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            P[i][j] = FPFt[i][j] + Q[i][j];
+        }
+    }
+}
+
+// =====================================================================
+// EKF - CORRECTION (accelerometer)
+// =====================================================================
+
+// EKF STAGE 4 - Predicted measurement h(q): gravity direction in the BODY frame.
+// q rotates body -> world, so h(q) = IMU_GRAVITY_SIGN * R(q)^T * [0, 0, 1].
+static void predict_gravity_stage_4(const double q[4], double h[3])
+{
+    double w = q[0], x = q[1], y = q[2], z = q[3];
+
+    h[0] = IMU_GRAVITY_SIGN * 2.0 * (x * z - w * y);
+    h[1] = IMU_GRAVITY_SIGN * 2.0 * (y * z + w * x);
+    h[2] = IMU_GRAVITY_SIGN * (w * w - x * x - y * y + z * z);
+}
+
+// EKF STAGE 5 - Measurement: accelerometer normalized to a unit vector
+static void normalize_accel_stage_5(const double a[3], double z_meas[3])
+{
+    double magnitude = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+
+    for (int i = 0; i < 3; i++) {
+        z_meas[i] = (magnitude < 1e-9) ? 0.0 : a[i] / magnitude;
+    }
+}
+
+// EKF STAGE 6 - Residual (innovation): y = z - h(q)
+static void residual_stage_6(const double z_meas[3], const double h[3], double residual[3])
+{
+    for (int i = 0; i < 3; i++) {
+        residual[i] = z_meas[i] - h[i];
+    }
+}
+
+// EKF STAGE 7 - Measurement Jacobian H = d h(q) / d [w, x, y, z] (matches stage 4)
+static void measurement_jacobian_h_stage_7(const double q[4], double H[3][4])
 {
     const double s = IMU_GRAVITY_SIGN;
+    double w = q[0], x = q[1], y = q[2], z = q[3];
 
-    H[0][0] = s * -2.0 * q_y;
-    H[0][1] = s *  2.0 * q_z;
-    H[0][2] = s * -2.0 * q_w;
-    H[0][3] = s *  2.0 * q_x;
-
-    H[1][0] = s *  2.0 * q_x;
-    H[1][1] = s *  2.0 * q_w;
-    H[1][2] = s *  2.0 * q_z;
-    H[1][3] = s *  2.0 * q_y;
-
-    H[2][0] = s *  2.0 * q_w;
-    H[2][1] = s * -2.0 * q_x;
-    H[2][2] = s * -2.0 * q_y;
-    H[2][3] = s *  2.0 * q_z;
-}
-
-// EKF STAGE 6
-// State transition Jacobian F
-void state_transition_jacobian_f_stage_6(double g_x, double g_y, double g_z, double dt, double F[4][4])
-{
-    F[0][0] = 1.0;
-    F[0][1] = -0.5 * g_x * dt;
-    F[0][2] = -0.5 * g_y * dt;
-    F[0][3] = -0.5 * g_z * dt;
-
-    F[1][0] = 0.5 * g_x * dt;
-    F[1][1] = 1.0;
-    F[1][2] = 0.5 * g_z * dt;
-    F[1][3] = -0.5 * g_y * dt;
-
-    F[2][0] = 0.5 * g_y * dt;
-    F[2][1] = -0.5 * g_z * dt;
-    F[2][2] = 1.0;
-    F[2][3] = 0.5 * g_x * dt;
-
-    F[3][0] = 0.5 * g_z * dt;
-    F[3][1] = 0.5 * g_y * dt;
-    F[3][2] = -0.5 * g_x * dt;
-    F[3][3] = 1.0;
-}
-
-// EKF STAGE 6
-// Covariance prediction
-void covariance_prediction_stage_6(double P[4][4], double F[4][4], double Q[4][4])
-{
-    double FP[4][4] = {{0.0}};
-    double F_transpose[4][4] = {{0.0}};
-    double P_predicted[4][4] = {{0.0}};
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            F_transpose[i][j] = F[j][i];
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 4; k++) {
-                FP[i][j] += F[i][k] * P[k][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 4; k++) {
-                P_predicted[i][j] += FP[i][k] * F_transpose[k][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            P[i][j] = P_predicted[i][j] + Q[i][j];
-        }
-    }
-}
-
-// EKF STAGE 7
-// Measurement noise covariance R
-void measurement_noise_stage_7(double R[3][3])
-{
-    R[0][0] = 0.01;
-    R[0][1] = 0.0;
-    R[0][2] = 0.0;
-
-    R[1][0] = 0.0;
-    R[1][1] = 0.01;
-    R[1][2] = 0.0;
-
-    R[2][0] = 0.0;
-    R[2][1] = 0.0;
-    R[2][2] = 0.01;
-}
-
-// EKF STAGE 8
-// Innovation covariance S
-void innovation_covariance_stage_8(double H[3][4], double P[4][4], double R[3][3], double S[3][3])
-{
-    double H_P[3][4] = {{0.0}};
-    double H_transpose[4][3] = {{0.0}};
+    double jacobian[3][4] = {
+        {s * -2.0 * y, s *  2.0 * z, s * -2.0 * w, s * 2.0 * x},
+        {s *  2.0 * x, s *  2.0 * w, s *  2.0 * z, s * 2.0 * y},
+        {s *  2.0 * w, s * -2.0 * x, s * -2.0 * y, s * 2.0 * z}
+    };
 
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 4; j++) {
-            H_transpose[j][i] = H[i][j];
+            H[i][j] = jacobian[i][j];
         }
     }
+}
 
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 4; k++) {
-                H_P[i][j] += H[i][k] * P[k][j];
-            }
-        }
-    }
+// EKF STAGE 8 - Innovation covariance: S = H P H^T + R
+static void innovation_covariance_stage_8(double H[3][4], double P[4][4], double R[3][3], double S[3][3])
+{
+    double HP[3][4];
+    double H_transpose[4][3];
+
+    mat_transpose(3, 4, H, H_transpose);
+    mat_mul(3, 4, 4, H, P, HP);
+    mat_mul(3, 4, 3, HP, H_transpose, S);
 
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
-            S[i][j] = R[i][j];
-
-            for (int k = 0; k < 4; k++) {
-                S[i][j] += H_P[i][k] * H_transpose[k][j];
-            }
+            S[i][j] += R[i][j];
         }
     }
 }
 
-// EKF STAGE 9
-// Kalman gain K
-// Returns false (and leaves K untouched) if S is singular; the caller must then skip the correction.
-bool kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double K[4][3])
+// EKF STAGE 9 - Kalman gain: K = P H^T S^-1
+// Returns false (K untouched) if S is singular; the caller then skips the correction.
+static bool kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double K[4][3])
 {
-    double H_transpose[4][3] = {{0.0}};
-    double P_H_transpose[4][3] = {{0.0}};
-    double S_inverse[3][3] = {{0.0}};
-
     double determinant =
           S[0][0] * (S[1][1] * S[2][2] - S[1][2] * S[2][1])
         - S[0][1] * (S[1][0] * S[2][2] - S[1][2] * S[2][0])
@@ -323,165 +302,153 @@ bool kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double 
         return false;
     }
 
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 4; j++) {
-            H_transpose[j][i] = H[i][j];
-        }
-    }
+    // 3x3 inverse via the adjugate
+    double S_inverse[3][3] = {
+        {(S[1][1] * S[2][2] - S[1][2] * S[2][1]) / determinant,
+         (S[0][2] * S[2][1] - S[0][1] * S[2][2]) / determinant,
+         (S[0][1] * S[1][2] - S[0][2] * S[1][1]) / determinant},
+        {(S[1][2] * S[2][0] - S[1][0] * S[2][2]) / determinant,
+         (S[0][0] * S[2][2] - S[0][2] * S[2][0]) / determinant,
+         (S[0][2] * S[1][0] - S[0][0] * S[1][2]) / determinant},
+        {(S[1][0] * S[2][1] - S[1][1] * S[2][0]) / determinant,
+         (S[0][1] * S[2][0] - S[0][0] * S[2][1]) / determinant,
+         (S[0][0] * S[1][1] - S[0][1] * S[1][0]) / determinant}
+    };
 
-    S_inverse[0][0] = (S[1][1] * S[2][2] - S[1][2] * S[2][1]) / determinant;
-    S_inverse[0][1] = (S[0][2] * S[2][1] - S[0][1] * S[2][2]) / determinant;
-    S_inverse[0][2] = (S[0][1] * S[1][2] - S[0][2] * S[1][1]) / determinant;
+    double H_transpose[4][3];
+    double P_H_transpose[4][3];
 
-    S_inverse[1][0] = (S[1][2] * S[2][0] - S[1][0] * S[2][2]) / determinant;
-    S_inverse[1][1] = (S[0][0] * S[2][2] - S[0][2] * S[2][0]) / determinant;
-    S_inverse[1][2] = (S[0][2] * S[1][0] - S[0][0] * S[1][2]) / determinant;
-
-    S_inverse[2][0] = (S[1][0] * S[2][1] - S[1][1] * S[2][0]) / determinant;
-    S_inverse[2][1] = (S[0][1] * S[2][0] - S[0][0] * S[2][1]) / determinant;
-    S_inverse[2][2] = (S[0][0] * S[1][1] - S[0][1] * S[1][0]) / determinant;
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 3; j++) {
-            for (int k = 0; k < 4; k++) {
-                P_H_transpose[i][j] += P[i][k] * H_transpose[k][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 3; j++) {
-            K[i][j] = 0.0;
-
-            for (int k = 0; k < 3; k++) {
-                K[i][j] += P_H_transpose[i][k] * S_inverse[k][j];
-            }
-        }
-    }
+    mat_transpose(3, 4, H, H_transpose);
+    mat_mul(4, 4, 3, P, H_transpose, P_H_transpose);
+    mat_mul(4, 3, 3, P_H_transpose, S_inverse, K);
 
     return true;
 }
 
-// EKF STAGE 10
-// Quaternion correction
-void quaternion_correction_stage_10(double *q_w, double *q_x, double *q_y, double *q_z, double K[4][3], double residual_x, double residual_y, double residual_z)
+// EKF STAGE 10 - Quaternion correction: q <- normalize(q + K y)
+static void correct_quaternion_stage_10(double q[4], double K[4][3], const double residual[3])
 {
-    double correction_w = K[0][0] * residual_x + K[0][1] * residual_y + K[0][2] * residual_z;
-    double correction_x = K[1][0] * residual_x + K[1][1] * residual_y + K[1][2] * residual_z;
-    double correction_y = K[2][0] * residual_x + K[2][1] * residual_y + K[2][2] * residual_z;
-    double correction_z = K[3][0] * residual_x + K[3][1] * residual_y + K[3][2] * residual_z;
-
-    *q_w += correction_w;
-    *q_x += correction_x;
-    *q_y += correction_y;
-    *q_z += correction_z;
-
-    double q_magnitude = sqrt(*q_w * *q_w + *q_x * *q_x + *q_y * *q_y + *q_z * *q_z);
-
-    if (q_magnitude < 1e-12) {
-        return;
+    for (int i = 0; i < 4; i++) {
+        q[i] += K[i][0] * residual[0] + K[i][1] * residual[1] + K[i][2] * residual[2];
     }
 
-    *q_w /= q_magnitude;
-    *q_x /= q_magnitude;
-    *q_y /= q_magnitude;
-    *q_z /= q_magnitude;
+    normalize_quaternion(q);
 }
 
-// EKF STAGE 11
-// Covariance update
-void covariance_update_stage_11(double P[4][4], double K[4][3], double H[3][4])
+// EKF STAGE 11 - Covariance update, Joseph form:
+//   P <- (I - K H) P (I - K H)^T + K R K^T
+// Mathematically equal to (I - K H) P, but keeps P symmetric and positive
+// definite despite rounding. A final symmetrization removes the remaining drift.
+static void update_covariance_stage_11(double P[4][4], double K[4][3], double H[3][4], double R[3][3])
 {
-    double K_H[4][4] = {{0.0}};
-    double I_minus_K_H[4][4] = {{0.0}};
-    double P_new[4][4] = {{0.0}};
+    double KH[4][4];
+    double A[4][4];             // I - K H
+    double A_transpose[4][4];
+    double AP[4][4];
+    double APAt[4][4];
+    double KR[4][3];
+    double K_transpose[3][4];
+    double KRKt[4][4];
+
+    mat_mul(4, 3, 4, K, H, KH);
 
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 3; k++) {
-                K_H[i][j] += K[i][k] * H[k][j];
-            }
+            A[i][j] = (i == j ? 1.0 : 0.0) - KH[i][j];
+        }
+    }
+
+    mat_transpose(4, 4, A, A_transpose);
+    mat_mul(4, 4, 4, A, P, AP);
+    mat_mul(4, 4, 4, AP, A_transpose, APAt);
+
+    mat_transpose(4, 3, K, K_transpose);
+    mat_mul(4, 3, 3, K, R, KR);
+    mat_mul(4, 3, 4, KR, K_transpose, KRKt);
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            P[i][j] = APAt[i][j] + KRKt[i][j];
         }
     }
 
     for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            if (i == j) {
-                I_minus_K_H[i][j] = 1.0 - K_H[i][j];
-            } else {
-                I_minus_K_H[i][j] = -K_H[i][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            for (int k = 0; k < 4; k++) {
-                P_new[i][j] += I_minus_K_H[i][k] * P[k][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            P[i][j] = P_new[i][j];
+        for (int j = i + 1; j < 4; j++) {
+            double average = 0.5 * (P[i][j] + P[j][i]);
+            P[i][j] = average;
+            P[j][i] = average;
         }
     }
 }
 
-// COMPLETE EKF UPDATE
-// Always runs the gyro prediction. The accelerometer correction runs only when
-// |a| is within 1 g +/- ACCEL_GATE_G (otherwise the device is accelerating and
-// the accelerometer does not point along gravity).
-// Returns true if the accelerometer correction was applied.
-bool ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][4], double Q[4][4], double R[3][3], double H[3][4], double F[4][4], double S[3][3], double K[4][3], double g_x, double g_y, double g_z, double a_x, double a_y, double a_z, double dt)
+// =====================================================================
+// EKF - PUBLIC API
+// =====================================================================
+void ekf_init(ekf_t *ekf)
 {
-    double predicted_g_x = 0.0;
-    double predicted_g_y = 0.0;
-    double predicted_g_z = 0.0;
+    ekf->q[0] = 1.0;
+    ekf->q[1] = 0.0;
+    ekf->q[2] = 0.0;
+    ekf->q[3] = 0.0;
 
-    double z_x = 0.0;
-    double z_y = 0.0;
-    double z_z = 0.0;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            ekf->P[i][j] = (i == j) ? EKF_P0 : 0.0;
+            ekf->Q[i][j] = (i == j) ? EKF_Q : 0.0;
+        }
+    }
 
-    double residual_x = 0.0;
-    double residual_y = 0.0;
-    double residual_z = 0.0;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            ekf->R[i][j] = (i == j) ? EKF_R : 0.0;
+        }
+    }
+}
 
-    // Prediction (gyro): state and covariance
-    quaternion_prediction_stage_1(q_w, q_x, q_y, q_z, g_x, g_y, g_z, dt);
-    state_transition_jacobian_f_stage_6(g_x, g_y, g_z, dt, F);
-    covariance_prediction_stage_6(P, F, Q);
+bool ekf_update(ekf_t *ekf, const double gyro[3], const double accel[3], double dt)
+{
+    double F[4][4];
+    double H[3][4];
+    double S[3][3];
+    double K[4][3];
 
-    // Accelerometer gate
-    double accel_magnitude = sqrt(a_x * a_x + a_y * a_y + a_z * a_z);
+    double h[3];
+    double z_meas[3];
+    double residual[3];
+
+    // Prediction (gyro)
+    predict_quaternion_stage_1(ekf->q, gyro, dt);
+    state_jacobian_f_stage_2(gyro, dt, F);
+    predict_covariance_stage_3(ekf->P, F, ekf->Q);
+
+    // Accelerometer gate: only a gravity reference when |a| is close to 1 g
+    double accel_magnitude = sqrt(accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]);
 
     if (fabs(accel_magnitude - 1.0) > ACCEL_GATE_G) {
         return false;
     }
 
     // Correction (accelerometer)
-    measurement_prediction_stage_2(*q_w, *q_x, *q_y, *q_z, &predicted_g_x, &predicted_g_y, &predicted_g_z);
-    acceleration_measurement_stage_3(a_x, a_y, a_z, &z_x, &z_y, &z_z);
-    residual_stage_4(z_x, z_y, z_z, predicted_g_x, predicted_g_y, predicted_g_z, &residual_x, &residual_y, &residual_z);
-    measurement_jacobian_h_stage_5(*q_w, *q_x, *q_y, *q_z, H);
-    measurement_noise_stage_7(R);
-    innovation_covariance_stage_8(H, P, R, S);
+    predict_gravity_stage_4(ekf->q, h);
+    normalize_accel_stage_5(accel, z_meas);
+    residual_stage_6(z_meas, h, residual);
+    measurement_jacobian_h_stage_7(ekf->q, H);
+    innovation_covariance_stage_8(H, ekf->P, ekf->R, S);
 
-    if (!kalman_gain_stage_9(P, H, S, K)) {
+    if (!kalman_gain_stage_9(ekf->P, H, S, K)) {
         return false;
     }
 
-    quaternion_correction_stage_10(q_w, q_x, q_y, q_z, K, residual_x, residual_y, residual_z);
-    covariance_update_stage_11(P, K, H);
+    correct_quaternion_stage_10(ekf->q, K, residual);
+    update_covariance_stage_11(ekf->P, K, H, ekf->R);
 
     return true;
 }
 
-// Tilt between the body Z axis and the world Z axis, in degrees (independent of IMU_GRAVITY_SIGN)
-double calculate_radar_angle(double q_w, double q_x, double q_y, double q_z)
+double ekf_radar_angle_deg(const ekf_t *ekf)
 {
-    double cos_tilt = q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z;
+    const double *q = ekf->q;
+    double cos_tilt = q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3];
 
     cos_tilt = fmax(-1.0, fmin(1.0, cos_tilt));
 
