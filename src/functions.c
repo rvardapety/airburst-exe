@@ -1,57 +1,62 @@
-#include "../include/functions.h"
+#define _POSIX_C_SOURCE 200809L
+
+#include "functions.h"
 
 #include <stdint.h>
 #include <math.h>
-#include <unistd.h>
+#include <time.h>
 
-uint8_t count = 0;
-airburst_state_t current_state = UNSTABLE;
+static uint8_t count = 0;
+static airburst_state_t current_state = UNSTABLE;
+
+static void sleep_ms(long ms)
+{
+    struct timespec duration = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+
+    nanosleep(&duration, NULL);
+}
 
 // AIRBURST FALL / STABILITY STATE
-airburst_state_t airburst_fall_state(accel_value_t accel_value, gyro_value_t gyro_value, double radar_angle)
+// Called once per control step with bias/offset-corrected magnitudes.
+//   any state  --(conditions not met)-------------------------> UNSTABLE (count reset)
+//   UNSTABLE   --(conditions met for STABLE_MEASUREMENT_COUNT)--> STABLE
+//   STABLE     --(conditions still met, next step)-------------> MEASURING
+//   MEASURING  --(conditions still met)------------------------> MEASURING
+airburst_state_t airburst_fall_state(double accel_magnitude_g, double gyro_magnitude_rad, double radar_angle_deg)
 {
-    double gx = (double)gyro_value.gyro_x;
-    double gy = (double)gyro_value.gyro_y;
-    double gz = (double)gyro_value.gyro_z;
+    bool conditions_met =
+        accel_magnitude_g >= STABLE_ACCEL_MIN_G &&
+        accel_magnitude_g < STABLE_ACCEL_MAX_G &&
+        gyro_magnitude_rad < STABLE_GYRO_THRESHOLD_RAD &&
+        radar_angle_deg <= RADAR_ANGLE_THRESHOLD_DEG;
 
-    double ax = (double)accel_value.accel_x;
-    double ay = (double)accel_value.accel_y;
-    double az = (double)accel_value.accel_z;
-
-    double gyro_magnitude = sqrt(gx * gx + gy * gy + gz * gz);
-    double accel_magnitude = sqrt(ax * ax + ay * ay + az * az);
-
-    if (accel_magnitude < ACCEL_THRESHOLD_VALUE_G) {
+    if (!conditions_met) {
         count = 0;
         current_state = UNSTABLE;
         return current_state;
     }
 
-    if (accel_magnitude >= STABLE_ACCEL_MIN_G &&
-        accel_magnitude < STABLE_ACCEL_MAX_G &&
-        gyro_magnitude < STABLE_GYRO_THRESHOLD_RAD &&
-        radar_angle <= RADAR_ANGLE_THRESHOLD_DEG) {
-        // Saturate: an unbounded uint8_t would wrap to 0 after 256 stable samples
-        if (count < STABLE_MEASUREMENT_COUNT) {
-            count++;
-        }
-
-        if (count >= STABLE_MEASUREMENT_COUNT) {
-            if (current_state == UNSTABLE) {
-                current_state = STABLE;
-            } else if (current_state == STABLE) {
-                current_state = MEASURING;
-            }
-
-            return current_state;
-        }
-
-        current_state = UNSTABLE;
-        return current_state;
+    // Saturate: an unbounded uint8_t would wrap to 0 after 256 stable samples
+    if (count < STABLE_MEASUREMENT_COUNT) {
+        count++;
     }
 
-    count = 0;
-    current_state = UNSTABLE;
+    switch (current_state) {
+    case UNSTABLE:
+        if (count >= STABLE_MEASUREMENT_COUNT) {
+            current_state = STABLE;
+        }
+        break;
+
+    case STABLE:
+        current_state = MEASURING;
+        break;
+
+    case MEASURING:
+    default:
+        break;
+    }
+
     return current_state;
 }
 
@@ -76,7 +81,7 @@ bool calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_
             valid_count++;
         }
 
-        usleep(10000);
+        sleep_ms(10);
     }
 
     if (valid_count == 0) {
@@ -302,7 +307,8 @@ void innovation_covariance_stage_8(double H[3][4], double P[4][4], double R[3][3
 
 // EKF STAGE 9
 // Kalman gain K
-void kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double K[4][3])
+// Returns false (and leaves K untouched) if S is singular; the caller must then skip the correction.
+bool kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double K[4][3])
 {
     double H_transpose[4][3] = {{0.0}};
     double P_H_transpose[4][3] = {{0.0}};
@@ -314,7 +320,7 @@ void kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double 
         + S[0][2] * (S[1][0] * S[2][1] - S[1][1] * S[2][0]);
 
     if (fabs(determinant) < 1e-12) {
-        return;
+        return false;
     }
 
     for (int i = 0; i < 3; i++) {
@@ -352,6 +358,8 @@ void kalman_gain_stage_9(double P[4][4], double H[3][4], double S[3][3], double 
             }
         }
     }
+
+    return true;
 }
 
 // EKF STAGE 10
@@ -422,7 +430,11 @@ void covariance_update_stage_11(double P[4][4], double K[4][3], double H[3][4])
 }
 
 // COMPLETE EKF UPDATE
-void ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][4], double Q[4][4], double R[3][3], double H[3][4], double F[4][4], double S[3][3], double K[4][3], double g_x, double g_y, double g_z, double a_x, double a_y, double a_z, double dt)
+// Always runs the gyro prediction. The accelerometer correction runs only when
+// |a| is within 1 g +/- ACCEL_GATE_G (otherwise the device is accelerating and
+// the accelerometer does not point along gravity).
+// Returns true if the accelerometer correction was applied.
+bool ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][4], double Q[4][4], double R[3][3], double H[3][4], double F[4][4], double S[3][3], double K[4][3], double g_x, double g_y, double g_z, double a_x, double a_y, double a_z, double dt)
 {
     double predicted_g_x = 0.0;
     double predicted_g_y = 0.0;
@@ -436,18 +448,34 @@ void ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][
     double residual_y = 0.0;
     double residual_z = 0.0;
 
+    // Prediction (gyro): state and covariance
     quaternion_prediction_stage_1(q_w, q_x, q_y, q_z, g_x, g_y, g_z, dt);
+    state_transition_jacobian_f_stage_6(g_x, g_y, g_z, dt, F);
+    covariance_prediction_stage_6(P, F, Q);
+
+    // Accelerometer gate
+    double accel_magnitude = sqrt(a_x * a_x + a_y * a_y + a_z * a_z);
+
+    if (fabs(accel_magnitude - 1.0) > ACCEL_GATE_G) {
+        return false;
+    }
+
+    // Correction (accelerometer)
     measurement_prediction_stage_2(*q_w, *q_x, *q_y, *q_z, &predicted_g_x, &predicted_g_y, &predicted_g_z);
     acceleration_measurement_stage_3(a_x, a_y, a_z, &z_x, &z_y, &z_z);
     residual_stage_4(z_x, z_y, z_z, predicted_g_x, predicted_g_y, predicted_g_z, &residual_x, &residual_y, &residual_z);
     measurement_jacobian_h_stage_5(*q_w, *q_x, *q_y, *q_z, H);
-    state_transition_jacobian_f_stage_6(g_x, g_y, g_z, dt, F);
-    covariance_prediction_stage_6(P, F, Q);
     measurement_noise_stage_7(R);
     innovation_covariance_stage_8(H, P, R, S);
-    kalman_gain_stage_9(P, H, S, K);
+
+    if (!kalman_gain_stage_9(P, H, S, K)) {
+        return false;
+    }
+
     quaternion_correction_stage_10(q_w, q_x, q_y, q_z, K, residual_x, residual_y, residual_z);
     covariance_update_stage_11(P, K, H);
+
+    return true;
 }
 
 // Tilt between the body Z axis and the world Z axis, in degrees (independent of IMU_GRAVITY_SIGN)
@@ -457,5 +485,5 @@ double calculate_radar_angle(double q_w, double q_x, double q_y, double q_z)
 
     cos_tilt = fmax(-1.0, fmin(1.0, cos_tilt));
 
-    return acos(cos_tilt) * 180.0 / M_PI;
+    return acos(cos_tilt) * RAD_TO_DEG;
 }

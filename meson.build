@@ -18,6 +18,7 @@ airburst_exe = executable(
                 'src/imu_test.c',
                 'src/functions.c',
         ],
+        include_directories : include_directories('include'),
         dependencies : dependencies,
         install : true
 )
