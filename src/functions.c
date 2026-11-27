@@ -31,7 +31,10 @@ airburst_state_t airburst_fall_state(accel_value_t accel_value, gyro_value_t gyr
         accel_magnitude < STABLE_ACCEL_MAX_G &&
         gyro_magnitude < STABLE_GYRO_THRESHOLD_RAD &&
         radar_angle <= RADAR_ANGLE_THRESHOLD_DEG) {
-        count++;
+        // Saturate: an unbounded uint8_t would wrap to 0 after 256 stable samples
+        if (count < STABLE_MEASUREMENT_COUNT) {
+            count++;
+        }
 
         if (count >= STABLE_MEASUREMENT_COUNT) {
             if (current_state == UNSTABLE) {
@@ -53,29 +56,41 @@ airburst_state_t airburst_fall_state(accel_value_t accel_value, gyro_value_t gyr
 }
 
 // GYROSCOPE BIAS CALCULATION
-void calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z)
+// Returns false if no gyro sample could be read; only successful reads are averaged
+bool calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z)
 {
-    gyro_value_t gyro;
+    gyro_value_t gyro = {0.0f, 0.0f, 0.0f};
 
     double sum_x = 0.0;
     double sum_y = 0.0;
     double sum_z = 0.0;
 
-    int measurement_count = 100;
+    const int measurement_count = 100;
+    int valid_count = 0;
 
     for (int i = 0; i < measurement_count; i++) {
-        imu_get_gyro_data(&gyro);
-
-        sum_x += (double)gyro.gyro_x;
-        sum_y += (double)gyro.gyro_y;
-        sum_z += (double)gyro.gyro_z;
+        if (imu_get_gyro_data(&gyro)) {
+            sum_x += (double)gyro.gyro_x;
+            sum_y += (double)gyro.gyro_y;
+            sum_z += (double)gyro.gyro_z;
+            valid_count++;
+        }
 
         usleep(10000);
     }
 
-    *gyro_bias_x = sum_x / measurement_count;
-    *gyro_bias_y = sum_y / measurement_count;
-    *gyro_bias_z = sum_z / measurement_count;
+    if (valid_count == 0) {
+        *gyro_bias_x = 0.0;
+        *gyro_bias_y = 0.0;
+        *gyro_bias_z = 0.0;
+        return false;
+    }
+
+    *gyro_bias_x = sum_x / valid_count;
+    *gyro_bias_y = sum_y / valid_count;
+    *gyro_bias_z = sum_z / valid_count;
+
+    return true;
 }
 
 // DT CALCULATION
@@ -116,12 +131,13 @@ void quaternion_prediction_stage_1(double *q_w, double *q_x, double *q_y, double
 }
 
 // EKF STAGE 2
-// Predicted gravity measurement
+// Predicted gravity measurement in the BODY frame.
+// q rotates body -> world (see stage 1), so h(q) = IMU_GRAVITY_SIGN * R(q)^T * [0, 0, 1].
 void measurement_prediction_stage_2(double q_w, double q_x, double q_y, double q_z, double *predicted_g_x, double *predicted_g_y, double *predicted_g_z)
 {
-    *predicted_g_x = 2.0 * (q_x * q_z + q_w * q_y);
-    *predicted_g_y = 2.0 * (q_y * q_z - q_w * q_x);
-    *predicted_g_z = -(q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z);
+    *predicted_g_x = IMU_GRAVITY_SIGN * 2.0 * (q_x * q_z - q_w * q_y);
+    *predicted_g_y = IMU_GRAVITY_SIGN * 2.0 * (q_y * q_z + q_w * q_x);
+    *predicted_g_z = IMU_GRAVITY_SIGN * (q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z);
 }
 
 // EKF STAGE 3
@@ -152,23 +168,25 @@ void residual_stage_4(double z_x, double z_y, double z_z, double predicted_g_x, 
 }
 
 // EKF STAGE 5
-// Measurement Jacobian H
+// Measurement Jacobian H = d h(q) / d [q_w, q_x, q_y, q_z] (must match stage 2)
 void measurement_jacobian_h_stage_5(double q_w, double q_x, double q_y, double q_z, double H[3][4])
 {
-    H[0][0] = 2.0 * q_y;
-    H[0][1] = 2.0 * q_z;
-    H[0][2] = 2.0 * q_w;
-    H[0][3] = 2.0 * q_x;
+    const double s = IMU_GRAVITY_SIGN;
 
-    H[1][0] = -2.0 * q_x;
-    H[1][1] = -2.0 * q_w;
-    H[1][2] = 2.0 * q_z;
-    H[1][3] = 2.0 * q_y;
+    H[0][0] = s * -2.0 * q_y;
+    H[0][1] = s *  2.0 * q_z;
+    H[0][2] = s * -2.0 * q_w;
+    H[0][3] = s *  2.0 * q_x;
 
-    H[2][0] = -2.0 * q_w;
-    H[2][1] = 2.0 * q_x;
-    H[2][2] = 2.0 * q_y;
-    H[2][3] = -2.0 * q_z;
+    H[1][0] = s *  2.0 * q_x;
+    H[1][1] = s *  2.0 * q_w;
+    H[1][2] = s *  2.0 * q_z;
+    H[1][3] = s *  2.0 * q_y;
+
+    H[2][0] = s *  2.0 * q_w;
+    H[2][1] = s * -2.0 * q_x;
+    H[2][2] = s * -2.0 * q_y;
+    H[2][3] = s *  2.0 * q_z;
 }
 
 // EKF STAGE 6
@@ -432,11 +450,12 @@ void ekf_update(double *q_w, double *q_x, double *q_y, double *q_z, double P[4][
     covariance_update_stage_11(P, K, H);
 }
 
+// Tilt between the body Z axis and the world Z axis, in degrees (independent of IMU_GRAVITY_SIGN)
 double calculate_radar_angle(double q_w, double q_x, double q_y, double q_z)
 {
-    double predicted_g_z = -(q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z);
+    double cos_tilt = q_w * q_w - q_x * q_x - q_y * q_y + q_z * q_z;
 
-    predicted_g_z = fmax(-1.0, fmin(1.0, predicted_g_z));
+    cos_tilt = fmax(-1.0, fmin(1.0, cos_tilt));
 
-    return acos(-predicted_g_z) * 180.0 / M_PI;
+    return acos(cos_tilt) * 180.0 / M_PI;
 }

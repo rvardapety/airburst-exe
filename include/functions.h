@@ -11,6 +11,13 @@
 #define RADAR_ANGLE_THRESHOLD_DEG 5.0
 #define STABLE_GYRO_THRESHOLD_RAD 0.261799
 
+// IMU mounting convention (used by the EKF measurement model).
+// The value is the accelerometer Z reading, in g, when the radar is level (0 deg):
+//   -1.0 -> IMU Z axis points down when level (accel_z reads about -1 g)  [previous behavior]
+//   +1.0 -> IMU Z axis points up when level   (accel_z reads about +1 g)
+// If the radar angle reads about 180 deg while level, flip this sign.
+#define IMU_GRAVITY_SIGN (-1.0)
+
 #define M_PI 3.14159265358979323846
 typedef enum {
     UNSTABLE,
@@ -23,7 +30,7 @@ typedef enum {
 airburst_state_t airburst_fall_state(accel_value_t accel_value, gyro_value_t gyro_value, double radar_angle);
 
 double calculate_dt(struct timespec *previous_time, const struct timespec *current_time);
-void calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z);
+bool calculate_gyro_bias(double *gyro_bias_x, double *gyro_bias_y, double *gyro_bias_z);
 void quaternion_prediction_stage_1(double *q_w, double *q_x, double *q_y, double *q_z, double g_x, double g_y, double g_z, double dt);
 void measurement_prediction_stage_2(double q_w, double q_x, double q_y, double q_z, double *predicted_g_x, double *predicted_g_y, double *predicted_g_z);
 void acceleration_measurement_stage_3(double a_x, double a_y, double a_z, double *z_x, double *z_y, double *z_z);
