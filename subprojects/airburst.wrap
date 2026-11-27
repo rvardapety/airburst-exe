@@ -1,3 +1,5 @@
 [wrap-git]
 url = https://github.com/rvardapety/airburst
-revision = HEAD
+# Pinned to the library commit this project is built and tested against.
+# Update this hash when the library changes.
+revision = fbe34dce7edf9a8b1999ce36bb74881e336f9351
